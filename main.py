@@ -132,18 +132,26 @@ class TikTokMonitor:
     """Класс для работы с TikTok через TikTokApi библиотеку"""
     
     def __init__(self):
-        self.api = None
+        self.api_class = None
         self.api_available = False
+        self.ms_token = os.getenv('TIKTOK_MS_TOKEN', None)  # ms_token из cookies браузера
         try:
             from TikTokApi import TikTokApi
-            # TikTokApi 6.3.0 может требовать инициализацию через async context manager
-            # Но попробуем использовать синхронно
-            self.api = TikTokApi()
+            self.api_class = TikTokApi
             self.api_available = True
+            if not self.ms_token:
+                logger.warning("TIKTOK_MS_TOKEN не установлен. TikTokApi может работать ограниченно.")
             logger.info("TikTokApi инициализирован успешно")
         except Exception as e:
             logger.warning(f"TikTokApi недоступен: {e}. Используется простой метод получения данных.")
             self.api_available = False
+        
+        # Headers для fallback методов
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+        }
     
     def extract_video_id(self, url: str) -> Optional[str]:
         """Извлечение ID видео из URL"""
@@ -175,73 +183,85 @@ class TikTokMonitor:
     
     async def get_video_stats(self, video_id: str, video_url: str) -> Optional[Dict]:
         """Получение статистики видео через TikTokApi"""
-        if self.api_available and self.api:
-            try:
-                # TikTokApi 6.3.0 может работать через метод .get() 
-                # Пробуем разные способы использования API
-                video_info = None
-                
-                # Способ 1: Прямой вызов через .get()
-                try:
-                    video_info = self.api.get(video_url)
-                except:
-                    pass
-                
-                # Способ 2: Через .video()
-                if not video_info:
-                    try:
-                        video = self.api.video(url=video_url)
-                        video_info = video.info()
-                        # Если info() возвращает async, ждем
-                        if asyncio.iscoroutine(video_info):
-                            video_info = await video_info
-                    except:
-                        pass
-                
-                # Способ 3: Через .video().stats()
-                if not video_info:
-                    try:
-                        video = self.api.video(url=video_url)
-                        video_info = video.stats()
-                        if asyncio.iscoroutine(video_info):
-                            video_info = await video_info
-                    except:
-                        pass
-                
-                if video_info:
-                    # Извлекаем статистику из различных форматов ответа
-                    stats_data = None
-                    
-                    if isinstance(video_info, dict):
-                        # Прямой доступ к stats
-                        if 'stats' in video_info:
-                            stats_data = video_info['stats']
-                        # Через itemInfo.itemStruct.stats
-                        elif 'itemInfo' in video_info:
-                            item_info = video_info['itemInfo']
-                            if isinstance(item_info, dict) and 'itemStruct' in item_info:
-                                item_struct = item_info['itemStruct']
-                                if isinstance(item_struct, dict) and 'stats' in item_struct:
-                                    stats_data = item_struct['stats']
-                        # Прямые ключи в корне
-                        elif 'playCount' in video_info or 'viewCount' in video_info:
-                            stats_data = video_info
-                    
-                    if stats_data and isinstance(stats_data, dict):
-                        return {
-                            'views': stats_data.get('playCount') or stats_data.get('viewCount') or 0,
-                            'likes': stats_data.get('diggCount') or stats_data.get('likeCount') or 0,
-                            'shares': stats_data.get('shareCount') or 0,
-                            'favorites': stats_data.get('collectCount') or 0,
-                        }
-                    else:
-                        logger.debug(f"Не удалось извлечь статистику из ответа TikTokApi для {video_id}")
-                        
-            except Exception as e:
-                logger.error(f"Ошибка получения данных через TikTokApi для {video_id}: {e}", exc_info=True)
+        if not self.api_available or not self.api_class:
+            logger.warning(f"TikTokApi недоступен для {video_id}")
+            return None
         
-        # Если TikTokApi недоступен или произошла ошибка, возвращаем None
-        logger.warning(f"Статистика не доступна для {video_id} через TikTokApi")
+        try:
+            # TikTokApi 6.3.0 требует async context manager
+            async with self.api_class() as api:
+                # Создаем сессии для работы с API
+                ms_tokens = [self.ms_token] if self.ms_token else []
+                await api.create_sessions(
+                    ms_tokens=ms_tokens,
+                    num_sessions=1,
+                    sleep_after=2,
+                    browser=os.getenv("TIKTOK_BROWSER", "chromium")
+                )
+                
+                # Получаем видео по URL
+                video = api.video(url=video_url)
+                
+                # Получаем информацию о видео
+                video_data = await video.info()
+                
+                # Извлекаем статистику из ответа
+                stats = None
+                
+                # Проверяем различные форматы ответа
+                if isinstance(video_data, dict):
+                    # Прямой доступ к stats
+                    if 'stats' in video_data:
+                        stats = video_data['stats']
+                    # Через itemInfo.itemStruct.stats (наиболее вероятный формат)
+                    elif 'itemInfo' in video_data:
+                        item_info = video_data['itemInfo']
+                        if isinstance(item_info, dict) and 'itemStruct' in item_info:
+                            item_struct = item_info['itemStruct']
+                            if isinstance(item_struct, dict) and 'stats' in item_struct:
+                                stats = item_struct['stats']
+                    # Через videoInfo.stats
+                    elif 'videoInfo' in video_data:
+                        video_info = video_data['videoInfo']
+                        if isinstance(video_info, dict) and 'stats' in video_info:
+                            stats = video_info['stats']
+                
+                # Если stats не найдено, пытаемся найти в самом объекте video_data
+                if not stats and isinstance(video_data, dict):
+                    # Прямые ключи статистики в корне
+                    if any(key in video_data for key in ['playCount', 'viewCount', 'diggCount', 'likeCount']):
+                        stats = video_data
+                
+                # Также пробуем получить через метод stats() объекта video
+                if not stats:
+                    try:
+                        stats_data = await video.stats()
+                        if isinstance(stats_data, dict):
+                            stats = stats_data
+                    except Exception as e:
+                        logger.debug(f"Метод stats() не доступен: {e}")
+                
+                # Извлекаем значения статистики
+                if stats and isinstance(stats, dict):
+                    result = {
+                        'views': stats.get('playCount') or stats.get('viewCount') or 0,
+                        'likes': stats.get('diggCount') or stats.get('likeCount') or 0,
+                        'shares': stats.get('shareCount') or 0,
+                        'favorites': stats.get('collectCount') or 0,
+                    }
+                    
+                    # Проверяем, что получили хотя бы одну статистику
+                    if any(v > 0 for v in result.values()):
+                        logger.info(f"Получена статистика для {video_id}: views={result['views']}, likes={result['likes']}")
+                        return result
+                    else:
+                        logger.warning(f"Статистика найдена, но все значения нулевые для {video_id}")
+                else:
+                    logger.warning(f"Не удалось извлечь статистику из ответа TikTokApi для {video_id}. Формат ответа: {type(video_data)}")
+                    
+        except Exception as e:
+            logger.error(f"Ошибка получения данных через TikTokApi для {video_id}: {e}", exc_info=True)
+        
         return None
     
     # Удаляем старые методы парсинга - используем только TikTokApi
