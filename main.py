@@ -162,10 +162,15 @@ class TikTokMonitor:
             response = requests.get(api_url, headers=self.headers, timeout=10)
             
             if response.status_code == 200:
-                data = response.json()
+                try:
+                    data = response.json()
+                    logger.debug(f"oEmbed API ответ получен для {video_id}")
+                except ValueError as json_err:
+                    # Если JSON невалидный, просто пропускаем и парсим страницу
+                    logger.debug(f"oEmbed API вернул невалидный JSON для {video_id}: {json_err}")
                 
                 # oEmbed API не предоставляет полную статистику
-                # Попробуем получить данные через веб-страницу
+                # Получаем данные через веб-страницу
                 return await self.scrape_video_page(video_url)
             else:
                 logger.warning(f"API вернул статус {response.status_code}")
@@ -173,7 +178,12 @@ class TikTokMonitor:
                 
         except Exception as e:
             logger.error(f"Ошибка получения статистики видео {video_id}: {e}")
-            return None
+            # Пытаемся все равно получить данные через парсинг страницы
+            try:
+                return await self.scrape_video_page(video_url)
+            except Exception as parse_err:
+                logger.error(f"Ошибка парсинга страницы для {video_id}: {parse_err}")
+                return None
     
     async def scrape_video_page(self, video_url: str) -> Optional[Dict]:
         """Парсинг страницы видео для получения статистики"""
