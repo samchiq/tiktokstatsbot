@@ -129,22 +129,18 @@ class VideoTracker:
         return result
 
 class TikTokMonitor:
-    """Класс для работы с TikTok через web scraping"""
+    """Класс для работы с TikTok через TikTokApi библиотеку"""
     
     def __init__(self):
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9,ru;q=0.8',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Cache-Control': 'max-age=0',
-            'Referer': 'https://www.tiktok.com/',
-        }
+        self.api = None
+        self.api_available = False
+        try:
+            from TikTokApi import TikTokApi
+            self.api = TikTokApi()
+            self.api_available = True
+            logger.info("TikTokApi инициализирован успешно")
+        except Exception as e:
+            logger.warning(f"TikTokApi недоступен: {e}. Используется простой метод получения данных.")
     
     def extract_video_id(self, url: str) -> Optional[str]:
         """Извлечение ID видео из URL"""
@@ -175,38 +171,45 @@ class TikTokMonitor:
         return None
     
     async def get_video_stats(self, video_id: str, video_url: str) -> Optional[Dict]:
-        """Получение статистики видео через API"""
-        try:
-            # Используем публичный TikTok API endpoint
-            api_url = f"https://www.tiktok.com/oembed?url={video_url}"
-            
-            response = requests.get(api_url, headers=self.headers, timeout=10)
-            
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                    logger.debug(f"oEmbed API ответ получен для {video_id}")
-                except ValueError as json_err:
-                    # Если JSON невалидный, просто пропускаем и парсим страницу
-                    logger.debug(f"oEmbed API вернул невалидный JSON для {video_id}: {json_err}")
-                
-                # oEmbed API не предоставляет полную статистику
-                # Получаем данные через веб-страницу
-                return await self.scrape_video_page(video_url)
-            else:
-                logger.warning(f"API вернул статус {response.status_code}")
-                return await self.scrape_video_page(video_url)
-                
-        except Exception as e:
-            logger.error(f"Ошибка получения статистики видео {video_id}: {e}")
-            # Пытаемся все равно получить данные через парсинг страницы
+        """Получение статистики видео через TikTokApi"""
+        if self.api_available and self.api:
             try:
-                return await self.scrape_video_page(video_url)
-            except Exception as parse_err:
-                logger.error(f"Ошибка парсинга страницы для {video_id}: {parse_err}")
-                return None
+                # Используем TikTokApi для получения информации о видео
+                video = self.api.video(url=video_url)
+                video_info = video.info()
+                
+                # Извлекаем статистику из различных форматов ответа
+                stats_data = None
+                
+                if isinstance(video_info, dict):
+                    # Прямой доступ к stats
+                    if 'stats' in video_info:
+                        stats_data = video_info['stats']
+                    # Через itemInfo.itemStruct.stats
+                    elif 'itemInfo' in video_info:
+                        item_info = video_info['itemInfo']
+                        if isinstance(item_info, dict) and 'itemStruct' in item_info:
+                            item_struct = item_info['itemStruct']
+                            if isinstance(item_struct, dict) and 'stats' in item_struct:
+                                stats_data = item_struct['stats']
+                
+                if stats_data and isinstance(stats_data, dict):
+                    return {
+                        'views': stats_data.get('playCount') or stats_data.get('viewCount') or 0,
+                        'likes': stats_data.get('diggCount') or stats_data.get('likeCount') or 0,
+                        'shares': stats_data.get('shareCount') or 0,
+                        'favorites': stats_data.get('collectCount') or 0,
+                    }
+                else:
+                    logger.warning(f"Не удалось извлечь статистику из ответа TikTokApi для {video_id}")
+            except Exception as e:
+                logger.error(f"Ошибка получения данных через TikTokApi для {video_id}: {e}")
+        
+        # Если TikTokApi недоступен или произошла ошибка, возвращаем None
+        logger.warning(f"Статистика не доступна для {video_id} через TikTokApi")
+        return None
     
-    async def scrape_video_page(self, video_url: str) -> Optional[Dict]:
+    # Удаляем старые методы парсинга - используем только TikTokApi
         """Парсинг страницы видео для получения статистики"""
         try:
             # Если это короткая ссылка, получаем редирект
