@@ -134,10 +134,16 @@ class TikTokMonitor:
     def __init__(self):
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9,ru;q=0.8',
             'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Cache-Control': 'max-age=0',
+            'Referer': 'https://www.tiktok.com/',
         }
     
     def extract_video_id(self, url: str) -> Optional[str]:
@@ -221,46 +227,83 @@ class TikTokMonitor:
             # Попытка найти JSON данные в script тегах
             stats = None
             
-            # Ищем JSON в script тегах с __UNIVERSAL_DATA_FOR_REHYDRATION__
-            script_match = re.search(r'<script[^>]*id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', html, re.DOTALL)
-            if script_match:
-                try:
-                    json_data = json.loads(script_match.group(1))
-                    # Пытаемся найти статистику в JSON структуре
-                    stats = self._extract_stats_from_json(json_data)
-                except (json.JSONDecodeError, Exception) as e:
-                    logger.debug(f"Не удалось распарсить JSON из script: {e}")
+            # Ищем JSON в разных script тегах
+            script_patterns = [
+                r'<script[^>]*id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
+                r'<script[^>]*>window\.__UNIVERSAL_DATA_FOR_REHYDRATION__\s*=\s*({.*?});</script>',
+                r'window\.__UNIVERSAL_DATA_FOR_REHYDRATION__\s*=\s*({.*?});',
+                r'<script[^>]*>.*?"stats".*?({.*?})</script>',
+            ]
+            
+            for pattern in script_patterns:
+                script_matches = re.finditer(pattern, html, re.DOTALL | re.IGNORECASE)
+                for match in script_matches:
+                    try:
+                        json_str = match.group(1) if match.groups() else match.group(0)
+                        # Пробуем распарсить как JSON
+                        try:
+                            json_data = json.loads(json_str)
+                            stats = self._extract_stats_from_json(json_data)
+                            if stats and any(v > 0 for v in stats.values()):
+                                logger.info(f"Найдена статистика в JSON: {stats}")
+                                break
+                        except json.JSONDecodeError:
+                            # Пробуем найти JSON объект внутри строки
+                            json_obj_match = re.search(r'\{[^{}]*"stats"[^{}]*\}', json_str)
+                            if json_obj_match:
+                                try:
+                                    json_data = json.loads(json_obj_match.group(0))
+                                    stats = self._extract_stats_from_json(json_data)
+                                    if stats and any(v > 0 for v in stats.values()):
+                                        logger.info(f"Найдена статистика в частичном JSON: {stats}")
+                                        break
+                                except json.JSONDecodeError:
+                                    continue
+                    except Exception as e:
+                        logger.debug(f"Ошибка парсинга script: {e}")
+                        continue
+                
+                if stats and any(v > 0 for v in stats.values()):
+                    break
             
             # Если не нашли в JSON, используем регулярные выражения
             if not stats or all(v == 0 for v in stats.values()):
                 views_patterns = [
-                    r'"playCount["\']?\s*:\s*["\']?(\d+)',
-                    r'"viewCount["\']?\s*:\s*["\']?(\d+)',
-                    r'"playCount":(\d+)',
-                    r'playCount&quot;:(\d+)',
-                    r'"stats".*?"playCount":(\d+)',
+                    r'"playCount["\']?\s*:\s*["\']?(\d+(?:[,\s]\d+)*)',
+                    r'"viewCount["\']?\s*:\s*["\']?(\d+(?:[,\s]\d+)*)',
+                    r'"playCount":(\d+(?:[,\s]\d+)*)',
+                    r'playCount&quot;:(\d+(?:[,\s]\d+)*)',
+                    r'"stats"[^}]*"playCount":(\d+(?:[,\s]\d+)*)',
+                    r'playCount["\']?\s*:\s*(\d+(?:[,\s]\d+)*)',
+                    r'(\d+(?:[,\s]\d+)*)\s*(?:views|просмотров)',
                 ]
                 
                 likes_patterns = [
-                    r'"diggCount["\']?\s*:\s*["\']?(\d+)',
-                    r'"likeCount["\']?\s*:\s*["\']?(\d+)',
-                    r'"diggCount":(\d+)',
-                    r'diggCount&quot;:(\d+)',
-                    r'"stats".*?"diggCount":(\d+)',
+                    r'"diggCount["\']?\s*:\s*["\']?(\d+(?:[,\s]\d+)*)',
+                    r'"likeCount["\']?\s*:\s*["\']?(\d+(?:[,\s]\d+)*)',
+                    r'"diggCount":(\d+(?:[,\s]\d+)*)',
+                    r'diggCount&quot;:(\d+(?:[,\s]\d+)*)',
+                    r'"stats"[^}]*"diggCount":(\d+(?:[,\s]\d+)*)',
+                    r'diggCount["\']?\s*:\s*(\d+(?:[,\s]\d+)*)',
+                    r'(\d+(?:[,\s]\d+)*)\s*(?:likes|лайков)',
                 ]
                 
                 shares_patterns = [
-                    r'"shareCount["\']?\s*:\s*["\']?(\d+)',
-                    r'"shareCount":(\d+)',
-                    r'shareCount&quot;:(\d+)',
-                    r'"stats".*?"shareCount":(\d+)',
+                    r'"shareCount["\']?\s*:\s*["\']?(\d+(?:[,\s]\d+)*)',
+                    r'"shareCount":(\d+(?:[,\s]\d+)*)',
+                    r'shareCount&quot;:(\d+(?:[,\s]\d+)*)',
+                    r'"stats"[^}]*"shareCount":(\d+(?:[,\s]\d+)*)',
+                    r'shareCount["\']?\s*:\s*(\d+(?:[,\s]\d+)*)',
+                    r'(\d+(?:[,\s]\d+)*)\s*(?:shares|репостов)',
                 ]
                 
                 favorites_patterns = [
-                    r'"collectCount["\']?\s*:\s*["\']?(\d+)',
-                    r'"collectCount":(\d+)',
-                    r'collectCount&quot;:(\d+)',
-                    r'"stats".*?"collectCount":(\d+)',
+                    r'"collectCount["\']?\s*:\s*["\']?(\d+(?:[,\s]\d+)*)',
+                    r'"collectCount":(\d+(?:[,\s]\d+)*)',
+                    r'collectCount&quot;:(\d+(?:[,\s]\d+)*)',
+                    r'"stats"[^}]*"collectCount":(\d+(?:[,\s]\d+)*)',
+                    r'collectCount["\']?\s*:\s*(\d+(?:[,\s]\d+)*)',
+                    r'(\d+(?:[,\s]\d+)*)\s*(?:favorites|избранное)',
                 ]
                 
                 def extract_stat(patterns):
@@ -282,7 +325,10 @@ class TikTokMonitor:
             
             # Проверяем, что хотя бы одна статистика найдена
             if not stats or all(v == 0 for v in stats.values()):
-                logger.warning("Не удалось извлечь статистику из HTML")
+                logger.warning(f"Не удалось извлечь статистику из HTML для {video_url}")
+                logger.debug(f"Размер HTML: {len(html)} символов")
+                # Сохраняем часть HTML для отладки (первые 5000 символов)
+                logger.debug(f"Начало HTML: {html[:5000]}")
                 return None  # Не возвращаем тестовые данные
             
             return stats
@@ -291,13 +337,22 @@ class TikTokMonitor:
             logger.error(f"Ошибка парсинга страницы: {e}")
             return None
     
-    def _extract_stats_from_json(self, data: dict) -> Optional[Dict]:
+    def _extract_stats_from_json(self, data) -> Optional[Dict]:
         """Рекурсивный поиск статистики в JSON структуре"""
+        if data is None:
+            return None
+            
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except json.JSONDecodeError:
+                return None
+        
         if not isinstance(data, dict):
             if isinstance(data, list):
                 for item in data:
                     result = self._extract_stats_from_json(item)
-                    if result:
+                    if result and any(v > 0 for v in result.values()):
                         return result
             return None
         
@@ -308,32 +363,45 @@ class TikTokMonitor:
         if 'stats' in data:
             stats_data = data['stats']
             if isinstance(stats_data, dict):
-                stats['views'] = stats_data.get('playCount', stats_data.get('viewCount', 0))
-                stats['likes'] = stats_data.get('diggCount', stats_data.get('likeCount', 0))
-                stats['shares'] = stats_data.get('shareCount', 0)
-                stats['favorites'] = stats_data.get('collectCount', 0)
-        
-        # Прямые ключи
-        if 'playCount' in data or 'viewCount' in data:
-            stats['views'] = data.get('playCount') or data.get('viewCount', 0)
-        if 'diggCount' in data or 'likeCount' in data:
-            stats['likes'] = data.get('diggCount') or data.get('likeCount', 0)
-        if 'shareCount' in data:
-            stats['shares'] = data.get('shareCount', 0)
-        if 'collectCount' in data:
-            stats['favorites'] = data.get('collectCount', 0)
-        
-        if stats:
-            return stats
-        
-        # Рекурсивно ищем в дочерних объектах
-        for key, value in data.items():
-            if isinstance(value, (dict, list)):
-                result = self._extract_stats_from_json(value)
+                stats['views'] = stats_data.get('playCount') or stats_data.get('viewCount') or 0
+                stats['likes'] = stats_data.get('diggCount') or stats_data.get('likeCount') or 0
+                stats['shares'] = stats_data.get('shareCount') or 0
+                stats['favorites'] = stats_data.get('collectCount') or 0
+            elif isinstance(stats_data, list) and len(stats_data) > 0:
+                # Если stats это список, берем первый элемент
+                result = self._extract_stats_from_json(stats_data[0])
                 if result:
+                    stats.update(result)
+        
+        # Прямые ключи в корневом объекте
+        if 'playCount' in data or 'viewCount' in data:
+            stats['views'] = data.get('playCount') or data.get('viewCount') or 0
+        if 'diggCount' in data or 'likeCount' in data:
+            stats['likes'] = data.get('diggCount') or data.get('likeCount') or 0
+        if 'shareCount' in data:
+            stats['shares'] = data.get('shareCount') or 0
+        if 'collectCount' in data:
+            stats['favorites'] = data.get('collectCount') or 0
+        
+        # Ищем в объекте videoInfo или itemInfo
+        for key in ['videoInfo', 'itemInfo', 'itemStruct', 'video', 'item']:
+            if key in data and isinstance(data[key], dict):
+                result = self._extract_stats_from_json(data[key])
+                if result and any(v > 0 for v in result.values()):
                     return result
         
-        return None
+        # Если нашли хотя бы одну статистику, возвращаем
+        if stats and any(v > 0 for v in stats.values()):
+            return stats
+        
+        # Рекурсивно ищем в дочерних объектах (ограничиваем глубину)
+        for key, value in list(data.items())[:20]:  # Ограничиваем количество ключей для производительности
+            if isinstance(value, (dict, list)) and key not in ['stats', 'videoInfo', 'itemInfo']:
+                result = self._extract_stats_from_json(value)
+                if result and any(v > 0 for v in result.values()):
+                    return result
+        
+        return stats if stats else None
 
 # Глобальные объекты
 tracker = VideoTracker()
