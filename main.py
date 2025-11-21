@@ -27,7 +27,8 @@ logger = logging.getLogger(__name__)
 # Конфигурация
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', 'YOUR_TELEGRAM_BOT_TOKEN')
 WEBHOOK_URL = os.getenv('WEBHOOK_URL', 'https://your-app.onrender.com')
-PORT = int(os.getenv('PORT', '10000'))
+port_str = os.getenv('PORT') or '10000'
+PORT = int(port_str)
 CHECK_INTERVAL_MINUTES = int(os.getenv('CHECK_INTERVAL', '10'))
 DATA_FILE = 'tracked_videos.json'
 
