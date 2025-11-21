@@ -16,6 +16,7 @@ from telegram.ext import (
 )
 import requests
 from bs4 import BeautifulSoup
+from telegram.request import HTTPXRequest
 
 # Настройка логирования
 logging.basicConfig(
@@ -141,10 +142,24 @@ class TikTokMonitor:
     
     def extract_video_id(self, url: str) -> Optional[str]:
         """Извлечение ID видео из URL"""
+        # Обработка коротких ссылок - сначала получаем редирект
+        if 'vm.tiktok.com' in url or 'vt.tiktok.com' in url:
+            try:
+                # Получаем редирект на полную страницу
+                response = requests.head(url, headers=self.headers, allow_redirects=True, timeout=10)
+                url = response.url
+            except Exception as e:
+                logger.warning(f"Не удалось получить редирект для {url}: {e}")
+                # Пытаемся извлечь ID из короткой ссылки
+                match = re.search(r'(?:vm\.tiktok\.com|vt\.tiktok\.com)/([A-Za-z0-9]+)', url)
+                if match:
+                    return match.group(1)
+        
+        # Паттерны для полных ссылок
         patterns = [
-            r'(?:vm\.tiktok\.com|vt\.tiktok\.com)/([A-Za-z0-9]+)',
             r'tiktok\.com/@[\w.-]+/video/(\d+)',
             r'tiktok\.com/.*?/video/(\d+)',
+            r'(?:vm\.tiktok\.com|vt\.tiktok\.com)/([A-Za-z0-9]+)',  # На случай, если редирект не сработал
         ]
         
         for pattern in patterns:
@@ -188,7 +203,13 @@ class TikTokMonitor:
     async def scrape_video_page(self, video_url: str) -> Optional[Dict]:
         """Парсинг страницы видео для получения статистики"""
         try:
-            response = requests.get(video_url, headers=self.headers, timeout=10)
+            # Если это короткая ссылка, получаем редирект
+            if 'vm.tiktok.com' in video_url or 'vt.tiktok.com' in video_url:
+                response = requests.head(video_url, headers=self.headers, allow_redirects=True, timeout=10)
+                video_url = response.url
+                logger.info(f"Получен редирект на: {video_url}")
+            
+            response = requests.get(video_url, headers=self.headers, timeout=15, allow_redirects=True)
             
             if response.status_code != 200:
                 logger.error(f"Не удалось загрузить страницу: {response.status_code}")
@@ -197,59 +218,122 @@ class TikTokMonitor:
             # Ищем JSON данные в HTML
             html = response.text
             
-            # Паттерны для поиска статистики в HTML
-            views_patterns = [
-                r'"playCount["\']?\s*:\s*["\']?(\d+)',
-                r'"viewCount["\']?\s*:\s*["\']?(\d+)',
-                r'playCount&quot;:(\d+)',
-            ]
+            # Попытка найти JSON данные в script тегах
+            stats = None
             
-            likes_patterns = [
-                r'"diggCount["\']?\s*:\s*["\']?(\d+)',
-                r'"likeCount["\']?\s*:\s*["\']?(\d+)',
-                r'diggCount&quot;:(\d+)',
-            ]
+            # Ищем JSON в script тегах с __UNIVERSAL_DATA_FOR_REHYDRATION__
+            script_match = re.search(r'<script[^>]*id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', html, re.DOTALL)
+            if script_match:
+                try:
+                    json_data = json.loads(script_match.group(1))
+                    # Пытаемся найти статистику в JSON структуре
+                    stats = self._extract_stats_from_json(json_data)
+                except (json.JSONDecodeError, Exception) as e:
+                    logger.debug(f"Не удалось распарсить JSON из script: {e}")
             
-            shares_patterns = [
-                r'"shareCount["\']?\s*:\s*["\']?(\d+)',
-                r'shareCount&quot;:(\d+)',
-            ]
-            
-            favorites_patterns = [
-                r'"collectCount["\']?\s*:\s*["\']?(\d+)',
-                r'collectCount&quot;:(\d+)',
-            ]
-            
-            def extract_stat(patterns):
-                for pattern in patterns:
-                    match = re.search(pattern, html)
-                    if match:
-                        return int(match.group(1))
-                return 0
-            
-            stats = {
-                'views': extract_stat(views_patterns),
-                'likes': extract_stat(likes_patterns),
-                'shares': extract_stat(shares_patterns),
-                'favorites': extract_stat(favorites_patterns),
-            }
+            # Если не нашли в JSON, используем регулярные выражения
+            if not stats or all(v == 0 for v in stats.values()):
+                views_patterns = [
+                    r'"playCount["\']?\s*:\s*["\']?(\d+)',
+                    r'"viewCount["\']?\s*:\s*["\']?(\d+)',
+                    r'"playCount":(\d+)',
+                    r'playCount&quot;:(\d+)',
+                    r'"stats".*?"playCount":(\d+)',
+                ]
+                
+                likes_patterns = [
+                    r'"diggCount["\']?\s*:\s*["\']?(\d+)',
+                    r'"likeCount["\']?\s*:\s*["\']?(\d+)',
+                    r'"diggCount":(\d+)',
+                    r'diggCount&quot;:(\d+)',
+                    r'"stats".*?"diggCount":(\d+)',
+                ]
+                
+                shares_patterns = [
+                    r'"shareCount["\']?\s*:\s*["\']?(\d+)',
+                    r'"shareCount":(\d+)',
+                    r'shareCount&quot;:(\d+)',
+                    r'"stats".*?"shareCount":(\d+)',
+                ]
+                
+                favorites_patterns = [
+                    r'"collectCount["\']?\s*:\s*["\']?(\d+)',
+                    r'"collectCount":(\d+)',
+                    r'collectCount&quot;:(\d+)',
+                    r'"stats".*?"collectCount":(\d+)',
+                ]
+                
+                def extract_stat(patterns):
+                    for pattern in patterns:
+                        match = re.search(pattern, html, re.IGNORECASE)
+                        if match:
+                            try:
+                                return int(match.group(1).replace(',', '').replace('.', ''))
+                            except ValueError:
+                                continue
+                    return 0
+                
+                stats = {
+                    'views': extract_stat(views_patterns),
+                    'likes': extract_stat(likes_patterns),
+                    'shares': extract_stat(shares_patterns),
+                    'favorites': extract_stat(favorites_patterns),
+                }
             
             # Проверяем, что хотя бы одна статистика найдена
-            if all(v == 0 for v in stats.values()):
+            if not stats or all(v == 0 for v in stats.values()):
                 logger.warning("Не удалось извлечь статистику из HTML")
-                # Возвращаем тестовые данные для демонстрации
-                return {
-                    'views': 1000,
-                    'likes': 100,
-                    'shares': 10,
-                    'favorites': 5,
-                }
+                return None  # Не возвращаем тестовые данные
             
             return stats
             
         except Exception as e:
             logger.error(f"Ошибка парсинга страницы: {e}")
             return None
+    
+    def _extract_stats_from_json(self, data: dict) -> Optional[Dict]:
+        """Рекурсивный поиск статистики в JSON структуре"""
+        if not isinstance(data, dict):
+            if isinstance(data, list):
+                for item in data:
+                    result = self._extract_stats_from_json(item)
+                    if result:
+                        return result
+            return None
+        
+        # Ищем ключи со статистикой
+        stats = {}
+        
+        # Пробуем найти статистику в различных форматах
+        if 'stats' in data:
+            stats_data = data['stats']
+            if isinstance(stats_data, dict):
+                stats['views'] = stats_data.get('playCount', stats_data.get('viewCount', 0))
+                stats['likes'] = stats_data.get('diggCount', stats_data.get('likeCount', 0))
+                stats['shares'] = stats_data.get('shareCount', 0)
+                stats['favorites'] = stats_data.get('collectCount', 0)
+        
+        # Прямые ключи
+        if 'playCount' in data or 'viewCount' in data:
+            stats['views'] = data.get('playCount') or data.get('viewCount', 0)
+        if 'diggCount' in data or 'likeCount' in data:
+            stats['likes'] = data.get('diggCount') or data.get('likeCount', 0)
+        if 'shareCount' in data:
+            stats['shares'] = data.get('shareCount', 0)
+        if 'collectCount' in data:
+            stats['favorites'] = data.get('collectCount', 0)
+        
+        if stats:
+            return stats
+        
+        # Рекурсивно ищем в дочерних объектах
+        for key, value in data.items():
+            if isinstance(value, (dict, list)):
+                result = self._extract_stats_from_json(value)
+                if result:
+                    return result
+        
+        return None
 
 # Глобальные объекты
 tracker = VideoTracker()
@@ -535,8 +619,15 @@ def main():
     """Главная функция запуска бота"""
     global application
     
-    # Создание приложения Telegram
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    # Создание приложения Telegram с увеличенными таймаутами
+    request = HTTPXRequest(
+        connection_pool_size=8,
+        read_timeout=30,
+        write_timeout=30,
+        connect_timeout=30,
+    )
+    
+    application = Application.builder().token(TELEGRAM_TOKEN).request(request).build()
     
     # Регистрация обработчиков команд
     application.add_handler(CommandHandler("start", start_command))
