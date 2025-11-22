@@ -1,605 +1,497 @@
 import os
 import logging
-import json
-import re
-from datetime import datetime
-from typing import Dict, List, Optional
 import asyncio
+import sqlite3
+from datetime import datetime, timedelta
+import aiohttp
 from aiohttp import web
-
+import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    CallbackQueryHandler
-)
-import requests
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+import urllib.parse
 
 # Настройка логирования
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 # Конфигурация
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', 'YOUR_TELEGRAM_BOT_TOKEN')
-WEBHOOK_URL = os.getenv('WEBHOOK_URL', 'https://your-app.onrender.com')
-PORT = int(os.getenv('PORT', '10000'))
-CHECK_INTERVAL_MINUTES = int(os.getenv('CHECK_INTERVAL', '72'))  # Изменено на 72 минуты для 20 запросов/день
-RAPIDAPI_KEY = os.getenv('RAPIDAPI_KEY', '8a8054913emsha5bb222aa3d3a45p158b8bjsn77f2a167e65f')
-DATA_FILE = 'tracked_videos.json'
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+RAPIDAPI_KEY = os.getenv('RAPIDAPI_KEY')
+WEBHOOK_URL = os.getenv('WEBHOOK_URL', 'https://tiktokstatsbot.onrender.com')
+PORT = int(os.getenv('PORT', 10000))
+CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', 5400))  # 90 минут
 
-class VideoTracker:
-    """Класс для хранения и управления отслеживаемыми видео"""
+# Инициализация базы данных
+def init_db():
+    conn = sqlite3.connect('tiktok_bot.db', check_same_thread=False)
+    cursor = conn.cursor()
     
-    def __init__(self):
-        self.data: Dict = self.load_data()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS monitored_videos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            video_id TEXT NOT NULL,
+            video_url TEXT NOT NULL,
+            last_views INTEGER DEFAULT 0,
+            last_likes INTEGER DEFAULT 0,
+            last_comments INTEGER DEFAULT 0,
+            last_shares INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(chat_id, video_id)
+        )
+    ''')
     
-    def load_data(self) -> Dict:
-        """Загрузка данных из файла"""
-        try:
-            if os.path.exists(DATA_FILE):
-                with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-        except Exception as e:
-            logger.error(f"Ошибка загрузки данных: {e}")
-        return {}
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS video_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            video_id TEXT NOT NULL,
+            views INTEGER,
+            likes INTEGER,
+            comments INTEGER,
+            shares INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
     
-    def save_data(self):
-        """Сохранение данных в файл"""
-        try:
-            with open(DATA_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error(f"Ошибка сохранения данных: {e}")
-    
-    def add_video(self, user_id: int, video_url: str, video_id: str):
-        """Добавление видео для отслеживания"""
-        user_key = str(user_id)
-        if user_key not in self.data:
-            self.data[user_key] = []
-        
-        # Проверка, не добавлено ли уже это видео
-        for video in self.data[user_key]:
-            if video['video_id'] == video_id:
-                return False
-        
-        self.data[user_key].append({
-            'video_id': video_id,
-            'video_url': video_url,
-            'added_at': datetime.now().isoformat(),
-            'last_views': 0,
-            'last_likes': 0,
-            'last_shares': 0,
-            'last_favorites': 0,
-            'notified_at_views': 0
-        })
-        self.save_data()
-        return True
-    
-    def remove_video(self, user_id: int, video_id: str) -> bool:
-        """Удаление видео из отслеживания"""
-        user_key = str(user_id)
-        if user_key not in self.data:
-            return False
-        
-        initial_length = len(self.data[user_key])
-        self.data[user_key] = [
-            v for v in self.data[user_key] if v['video_id'] != video_id
-        ]
-        
-        if len(self.data[user_key]) == 0:
-            del self.data[user_key]
-        
-        if initial_length > len(self.data.get(str(user_id), [])):
-            self.save_data()
-            return True
-        return False
-    
-    def get_user_videos(self, user_id: int) -> List[Dict]:
-        """Получение всех видео пользователя"""
-        return self.data.get(str(user_id), [])
-    
-    def update_video_stats(self, user_id: int, video_id: str, stats: Dict):
-        """Обновление статистики видео"""
-        user_key = str(user_id)
-        if user_key not in self.data:
-            return
-        
-        for video in self.data[user_key]:
-            if video['video_id'] == video_id:
-                video['last_views'] = stats.get('views', 0)
-                video['last_likes'] = stats.get('likes', 0)
-                video['last_shares'] = stats.get('shares', 0)
-                video['last_favorites'] = stats.get('favorites', 0)
-                break
-        
-        self.save_data()
-    
-    def get_all_tracked_videos(self) -> List[tuple]:
-        """Получение всех отслеживаемых видео"""
-        result = []
-        for user_id, videos in self.data.items():
-            for video in videos:
-                result.append((int(user_id), video))
-        return result
+    conn.commit()
+    return conn
+
+# Глобальное соединение с БД
+db_conn = init_db()
 
 class TikTokMonitor:
-    """Класс для работы с TikTok через RapidAPI"""
-    
     def __init__(self):
-        self.api_key = RAPIDAPI_KEY
-        self.api_host = "tiktok-scraper2.p.rapidapi.com"
-        self.headers = {
-            "X-RapidAPI-Key": self.api_key,
-            "X-RapidAPI-Host": self.api_host
-        }
-    
-    def extract_video_id(self, url: str) -> Optional[str]:
-        """Извлечение ID видео из URL"""
-        # Обработка коротких ссылок
-        if 'vm.tiktok.com' in url or 'vt.tiktok.com' in url:
-            try:
-                response = requests.head(url, allow_redirects=True, timeout=10)
-                url = response.url
-                logger.info(f"Получен редирект на: {url}")
-            except Exception as e:
-                logger.warning(f"Не удалось получить редирект: {e}")
+        self.session = None
         
-        # Паттерны для извлечения ID
-        patterns = [
-            r'tiktok\.com/@[\w.-]+/video/(\d+)',
-            r'tiktok\.com/.*?/video/(\d+)',
-            r'(?:vm\.tiktok\.com|vt\.tiktok\.com)/([A-Za-z0-9]+)',
-        ]
+    async def get_session(self):
+        if self.session is None:
+            self.session = aiohttp.ClientSession()
+        return self.session
         
-        for pattern in patterns:
-            match = re.search(pattern, url)
-            if match:
-                return match.group(1)
-        return None
-    
-    async def get_video_stats(self, video_id: str, video_url: str) -> Optional[Dict]:
+    async def close_session(self):
+        if self.session:
+            await self.session.close()
+            self.session = None
+
+    async def get_video_stats(self, video_id):
         """Получение статистики видео через RapidAPI"""
-        try:
-            # RapidAPI TikTok Scraper2 endpoint
-            api_url = "https://tiktok-scraper2.p.rapidapi.com/video/info"
-            
-            querystring = {"video_url": video_url}
-            
-            logger.info(f"Запрос к RapidAPI для: {video_id}")
-            response = requests.get(api_url, headers=self.headers, params=querystring, timeout=15)
-            
-            if response.status_code == 200:
-                data = response.json()
-                logger.debug(f"Ответ API: {json.dumps(data, indent=2)[:500]}")
-                
-                # Извлекаем статистику из ответа
-                stats = self._extract_stats_from_response(data)
-                
-                if stats and any(v > 0 for v in stats.values()):
-                    logger.info(f"✅ Статистика для {video_id}: views={stats['views']}, likes={stats['likes']}")
-                    return stats
-                else:
-                    logger.warning(f"Статистика получена, но все значения нулевые")
-                    return None
-            
-            elif response.status_code == 429:
-                logger.error(f"❌ Превышен лимит запросов RapidAPI (429)")
-                return None
-            
-            elif response.status_code == 403:
-                logger.error(f"❌ Ошибка доступа к RapidAPI (403) - проверьте ключ")
-                return None
-            
-            else:
-                logger.error(f"❌ Ошибка API: {response.status_code} - {response.text[:200]}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Ошибка получения статистики: {e}", exc_info=True)
+        if not RAPIDAPI_KEY:
+            logger.error("RAPIDAPI_KEY не настроен")
             return None
-    
-    def _extract_stats_from_response(self, data: dict) -> Optional[Dict]:
-        """Извлечение статистики из ответа RapidAPI"""
+            
+        url = "https://tiktok-scraper2.p.rapidapi.com/video/info"
+        querystring = {"video_id": video_id}
+        
+        headers = {
+            "X-RapidAPI-Key": RAPIDAPI_KEY,
+            "X-RapidAPI-Host": "tiktok-scraper2.p.rapidapi.com"
+        }
+
         try:
-            # Разные форматы ответа API
-            stats_data = None
-            
-            # Формат 1: data.stats
-            if 'data' in data and isinstance(data['data'], dict):
-                if 'stats' in data['data']:
-                    stats_data = data['data']['stats']
-                elif 'play_count' in data['data'] or 'playCount' in data['data']:
-                    stats_data = data['data']
-            
-            # Формат 2: прямо stats в корне
-            elif 'stats' in data:
-                stats_data = data['stats']
-            
-            # Формат 3: video_info или itemInfo
-            elif 'video_info' in data:
-                stats_data = data['video_info'].get('stats')
-            elif 'itemInfo' in data:
-                item_struct = data['itemInfo'].get('itemStruct', {})
-                stats_data = item_struct.get('stats')
-            
-            if not stats_data:
-                logger.warning("Не удалось найти stats в ответе API")
-                return None
-            
-            # Извлекаем значения (поддерживаем разные форматы ключей)
-            result = {
-                'views': (
-                    stats_data.get('playCount') or 
-                    stats_data.get('play_count') or 
-                    stats_data.get('viewCount') or 
-                    stats_data.get('view_count') or 0
-                ),
-                'likes': (
-                    stats_data.get('diggCount') or 
-                    stats_data.get('digg_count') or 
-                    stats_data.get('likeCount') or 
-                    stats_data.get('like_count') or 0
-                ),
-                'shares': (
-                    stats_data.get('shareCount') or 
-                    stats_data.get('share_count') or 0
-                ),
-                'favorites': (
-                    stats_data.get('collectCount') or 
-                    stats_data.get('collect_count') or 0
-                )
-            }
-            
-            return result
-            
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(url, headers=headers, params=querystring)
+                response.raise_for_status()
+                data = response.json()
+                
+                logger.info(f"Ответ API для {video_id}: {data}")
+                
+                # Обработка разных форматов ответа
+                stats = None
+                if isinstance(data, dict):
+                    if 'data' in data and isinstance(data['data'], dict):
+                        stats = data['data'].get('stats', {})
+                    elif 'stats' in data:
+                        stats = data['stats']
+                    else:
+                        stats = data
+                
+                if not stats:
+                    logger.warning("Не удалось найти stats в ответе API")
+                    return None
+                
+                # Извлечение статистики
+                views = stats.get('playCount') or stats.get('views') or 0
+                likes = stats.get('diggCount') or stats.get('likes') or 0
+                comments = stats.get('commentCount') or stats.get('comments') or 0
+                shares = stats.get('shareCount') or stats.get('shares') or 0
+
+                result = {
+                    'views': int(views) if views else 0,
+                    'likes': int(likes) if likes else 0,
+                    'comments': int(comments) if comments else 0,
+                    'shares': int(shares) if shares else 0
+                }
+                
+                # Проверка на нулевые значения
+                if all(value == 0 for value in result.values()):
+                    logger.warning("Все статистические данные нулевые")
+                    return None
+                    
+                return result
+                
         except Exception as e:
-            logger.error(f"Ошибка парсинга ответа API: {e}")
+            logger.error(f"Ошибка при получении статистики: {e}")
             return None
 
-# Глобальные объекты
-tracker = VideoTracker()
+    def extract_video_id(self, url):
+        """Извлечение ID видео из URL TikTok"""
+        try:
+            parsed = urllib.parse.urlparse(url)
+            if 'vm.tiktok.com' in url or 'vt.tiktok.com' in url:
+                return self.get_redirect_video_id(url)
+            
+            path_parts = parsed.path.split('/')
+            if 'video' in path_parts:
+                video_index = path_parts.index('video')
+                if video_index + 1 < len(path_parts):
+                    return path_parts[video_index + 1].split('?')[0]
+                    
+            return None
+        except Exception as e:
+            logger.error(f"Ошибка извлечения ID: {e}")
+            return None
+
+    async def get_redirect_video_id(self, short_url):
+        """Получение ID из короткой ссылки"""
+        try:
+            async with httpx.AsyncClient(follow_redirects=True) as client:
+                response = await client.get(short_url)
+                final_url = str(response.url)
+                return self.extract_video_id(final_url)
+        except Exception as e:
+            logger.error(f"Ошибка получения ID из короткой ссылки: {e}")
+            return None
+
+# Инициализация монитора
 tiktok_monitor = TikTokMonitor()
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
-    welcome_message = (
-        "🎵 *Добро пожаловать в TikTok Monitor Bot!*\n\n"
-        "Я помогу вам отслеживать статистику ваших TikTok видео и буду присылать "
-        "уведомления каждые 50,000 просмотров!\n\n"
-        "📋 *Доступные команды:*\n\n"
-        "/set `<ссылка>` \\- Добавить видео для отслеживания\n"
-        "/stats \\- Показать статистику всех отслеживаемых видео\n"
-        "/remove \\- Удалить видео из отслеживания\n\n"
-        "📊 *Что я отслеживаю:*\n"
-        "• Просмотры \\(уведомления каждые 50K\\)\n"
-        "• Лайки\n"
-        "• Репосты\n"
-        "• Добавления в избранное\n\n"
-        f"⏱ Проверка статистики каждые {CHECK_INTERVAL_MINUTES} минут\n\n"
-        "Начните с команды /set и укажите ссылку на ваше TikTok видео\\!"
-    )
-    await update.message.reply_text(welcome_message, parse_mode='MarkdownV2')
+    welcome_text = """
+🎵 TikTok Stats Monitor Bot
 
-async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /set"""
-    user_id = update.effective_user.id
+Отправьте мне ссылку на видео TikTok, и я буду отслеживать его статистику.
+
+Команды:
+/start - показать это сообщение
+/list - список отслеживаемых видео
+/help - помощь
+
+Просто отправьте ссылку на видео TikTok!
+    """
+    await update.message.reply_text(welcome_text)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /help"""
+    help_text = """
+📖 Помощь по боту
+
+Как использовать:
+1. Отправьте ссылку на видео TikTok
+2. Бот начнет отслеживать статистику
+3. Получайте обновления каждые 90 минут
+
+Форматы ссылок:
+• https://vm.tiktok.com/ZSJxxxxxxxx/
+• https://www.tiktok.com/@user/video/1234567890123456789
+• https://vt.tiktok.com/ZSJxxxxxxxx/
+
+Команды:
+/list - показать все отслеживаемые видео
+/stats [ссылка] - получить текущую статистику
+    """
+    await update.message.reply_text(help_text)
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка текстовых сообщений"""
+    text = update.message.text.strip()
     
-    if not context.args:
-        await update.message.reply_text(
-            "❌ Пожалуйста, укажите ссылку на TikTok видео\n\n"
-            "Пример: /set https://www.tiktok.com/@username/video/1234567890"
-        )
+    if not any(domain in text for domain in ['tiktok.com', 'vm.tiktok.com', 'vt.tiktok.com']):
+        await update.message.reply_text("❌ Пожалуйста, отправьте действительную ссылку на видео TikTok.")
         return
-    
-    video_url = context.args[0]
-    video_id = tiktok_monitor.extract_video_id(video_url)
-    
+
+    video_id = tiktok_monitor.extract_video_id(text)
     if not video_id:
-        await update.message.reply_text(
-            "❌ Не удалось распознать ссылку на TikTok видео.\n\n"
-            "Убедитесь, что ссылка имеет формат:\n"
-            "• https://www.tiktok.com/@username/video/1234567890\n"
-            "• https://vm.tiktok.com/ZMabcdefg/"
-        )
+        await update.message.reply_text("❌ Не удалось извлечь ID видео из ссылки.")
         return
+
+    # Проверяем существование видео
+    loading_msg = await update.message.reply_text("🔍 Проверяем видео...")
     
-    # Отправка сообщения о загрузке
-    loading_msg = await update.message.reply_text("⏳ Получаю информацию о видео...")
-    
-    # Получение начальной статистики
-    stats = await tiktok_monitor.get_video_stats(video_id, video_url)
-    
+    stats = await tiktok_monitor.get_video_stats(video_id)
     if not stats:
-        await loading_msg.edit_text(
-            "❌ Не удалось получить информацию о видео.\n\n"
-            "Возможные причины:\n"
-            "• Видео недоступно или приватное\n"
-            "• Превышен лимит запросов API (20/день)\n"
-            "• Проблемы с RapidAPI\n\n"
-            "Попробуйте позже или проверьте ссылку."
-        )
+        await loading_msg.edit_text("❌ Не удалось получить статистику видео. Проверьте ссылку.")
         return
-    
-    # Добавление видео
-    if tracker.add_video(user_id, video_url, video_id):
-        tracker.update_video_stats(user_id, video_id, stats)
-        
-        message = (
-            f"✅ *Видео добавлено для отслеживания!*\n\n"
-            f"🔗 ID: `{video_id}`\n\n"
-            f"📊 *Текущая статистика:*\n"
-            f"👁 Просмотры: *{stats['views']:,}*\n"
-            f"❤️ Лайки: *{stats['likes']:,}*\n"
-            f"🔄 Репосты: *{stats['shares']:,}*\n"
-            f"⭐ Избранное: *{stats['favorites']:,}*\n\n"
-            f"⏱ Проверка каждые {CHECK_INTERVAL_MINUTES} минут\n"
-            f"🔔 Уведомление каждые 50,000 просмотров!"
-        )
-        await loading_msg.edit_text(message, parse_mode='Markdown')
-    else:
-        await loading_msg.edit_text("⚠️ Это видео уже отслеживается!")
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /stats"""
-    user_id = update.effective_user.id
-    videos = tracker.get_user_videos(user_id)
+    # Сохраняем видео для отслеживания
+    chat_id = update.message.chat_id
+    
+    try:
+        cursor = db_conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO monitored_videos 
+            (chat_id, video_id, video_url, last_views, last_likes, last_comments, last_shares)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (chat_id, video_id, text, stats['views'], stats['likes'], stats['comments'], stats['shares']))
+        
+        db_conn.commit()
+        
+        # Сохраняем историю статистики
+        cursor.execute('''
+            INSERT INTO video_stats (video_id, views, likes, comments, shares)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (video_id, stats['views'], stats['likes'], stats['comments'], stats['shares']))
+        
+        db_conn.commit()
+        
+        # Создаем клавиатуру с действиями
+        keyboard = [
+            [InlineKeyboardButton("🔄 Обновить", callback_data=f"refresh_{video_id}")],
+            [InlineKeyboardButton("❌ Удалить", callback_data=f"delete_{video_id}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        stats_text = f"""
+✅ Видео добавлено для отслеживания!
+
+📊 Текущая статистика:
+👁️ Просмотры: {stats['views']:,}
+❤️ Лайки: {stats['likes']:,}
+💬 Комментарии: {stats['comments']:,}
+↩️ Репосты: {stats['shares']:,}
+
+Бот будет проверять статистику каждые 90 минут.
+        """.strip()
+        
+        await loading_msg.edit_text(stats_text, reply_markup=reply_markup)
+        
+    except Exception as e:
+        logger.error(f"Ошибка сохранения видео: {e}")
+        await loading_msg.edit_text("❌ Ошибка при сохранении видео.")
+
+async def list_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать список отслеживаемых видео"""
+    chat_id = update.message.chat_id
+    
+    cursor = db_conn.cursor()
+    cursor.execute('''
+        SELECT video_id, video_url, last_views, last_likes, last_comments, last_shares
+        FROM monitored_videos 
+        WHERE chat_id = ?
+    ''', (chat_id,))
+    
+    videos = cursor.fetchall()
     
     if not videos:
-        await update.message.reply_text(
-            "📭 У вас нет отслеживаемых видео.\n\n"
-            "Используйте команду /set чтобы добавить видео."
-        )
+        await update.message.reply_text("📭 У вас нет отслеживаемых видео.")
         return
     
-    loading_msg = await update.message.reply_text("⏳ Обновляю статистику...")
+    message_text = "📋 Ваши отслеживаемые видео:\n\n"
     
-    message_parts = ["📊 *Статистика ваших видео:*\n"]
+    for i, (video_id, url, views, likes, comments, shares) in enumerate(videos, 1):
+        message_text += f"{i}. {url}\n"
+        message_text += f"   👁️ {views:,} | ❤️ {likes:,} | 💬 {comments:,} | ↩️ {shares:,}\n\n"
     
-    for idx, video in enumerate(videos, 1):
-        video_id = video['video_id']
-        video_url = video['video_url']
-        
-        # Получение актуальной статистики
-        stats = await tiktok_monitor.get_video_stats(video_id, video_url)
-        
-        if stats:
-            tracker.update_video_stats(user_id, video_id, stats)
-            
-            # Расчет прогресса до следующего уведомления
-            current_views = stats['views']
-            next_milestone = ((current_views // 50000) + 1) * 50000
-            progress = current_views % 50000
-            progress_percent = (progress / 50000) * 100
-            
-            message_parts.append(
-                f"\n*{idx}. Видео* `{video_id[:12]}...`\n"
-                f"👁 Просмотры: *{stats['views']:,}*\n"
-                f"❤️ Лайки: *{stats['likes']:,}*\n"
-                f"🔄 Репосты: *{stats['shares']:,}*\n"
-                f"⭐ Избранное: *{stats['favorites']:,}*\n"
-                f"📈 До вехи: *{next_milestone - current_views:,}* ({progress_percent:.1f}%)\n"
-            )
-        else:
-            message_parts.append(
-                f"\n*{idx}. Видео* `{video_id[:12]}...`\n"
-                f"❌ Не удалось получить статистику\n"
-                f"(возможно превышен лимит API)\n"
-            )
-    
-    await loading_msg.edit_text(''.join(message_parts), parse_mode='Markdown')
+    await update.message.reply_text(message_text)
 
-async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /remove"""
-    user_id = update.effective_user.id
-    videos = tracker.get_user_videos(user_id)
-    
-    if not videos:
-        await update.message.reply_text(
-            "📭 У вас нет отслеживаемых видео для удаления."
-        )
-        return
-    
-    # Создание клавиатуры с кнопками
-    keyboard = []
-    for video in videos:
-        video_id = video['video_id']
-        keyboard.append([
-            InlineKeyboardButton(
-                f"🗑 Удалить {video_id[:15]}...",
-                callback_data=f"remove_{video_id}"
-            )
-        ])
-    
-    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        "Выберите видео для удаления:",
-        reply_markup=reply_markup
-    )
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик нажатий на кнопки"""
     query = update.callback_query
     await query.answer()
     
-    user_id = update.effective_user.id
     data = query.data
+    chat_id = query.message.chat_id
     
-    if data == "cancel":
-        await query.edit_message_text("❌ Отменено")
+    if data.startswith('refresh_'):
+        video_id = data.split('_')[1]
+        await refresh_stats(query, video_id)
+        
+    elif data.startswith('delete_'):
+        video_id = data.split('_')[1]
+        await delete_video(query, video_id)
+
+async def refresh_stats(query, video_id):
+    """Обновление статистики"""
+    loading_msg = await query.edit_message_text("🔄 Обновляем статистику...")
+    
+    stats = await tiktok_monitor.get_video_stats(video_id)
+    if not stats:
+        await loading_msg.edit_text("❌ Не удалось обновить статистику.")
         return
     
-    if data.startswith("remove_"):
-        video_id = data.replace("remove_", "")
-        
-        if tracker.remove_video(user_id, video_id):
-            await query.edit_message_text(
-                f"✅ Видео `{video_id}` удалено из отслеживания",
-                parse_mode='Markdown'
-            )
-        else:
-            await query.edit_message_text("❌ Видео не найдено")
+    # Обновляем статистику в БД
+    cursor = db_conn.cursor()
+    cursor.execute('''
+        UPDATE monitored_videos 
+        SET last_views = ?, last_likes = ?, last_comments = ?, last_shares = ?
+        WHERE video_id = ?
+    ''', (stats['views'], stats['likes'], stats['comments'], stats['shares'], video_id))
+    
+    cursor.execute('''
+        INSERT INTO video_stats (video_id, views, likes, comments, shares)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (video_id, stats['views'], stats['likes'], stats['comments'], stats['shares']))
+    
+    db_conn.commit()
+    
+    # Обновляем клавиатуру
+    keyboard = [
+        [InlineKeyboardButton("🔄 Обновить", callback_data=f"refresh_{video_id}")],
+        [InlineKeyboardButton("❌ Удалить", callback_data=f"delete_{video_id}")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    stats_text = f"""
+📊 Обновленная статистика:
 
-async def check_videos_task(application: Application):
-    """Периодическая проверка всех отслеживаемых видео"""
+👁️ Просмотры: {stats['views']:,}
+❤️ Лайки: {stats['likes']:,}
+💬 Комментарии: {stats['comments']:,}
+↩️ Репосты: {stats['shares']:,}
+    """.strip()
+    
+    await loading_msg.edit_text(stats_text, reply_markup=reply_markup)
+
+async def delete_video(query, video_id):
+    """Удаление видео из отслеживания"""
+    cursor = db_conn.cursor()
+    cursor.execute('DELETE FROM monitored_videos WHERE video_id = ?', (video_id,))
+    db_conn.commit()
+    
+    await query.edit_message_text("✅ Видео удалено из отслеживания.")
+
+async def check_videos_task(context: ContextTypes.DEFAULT_TYPE):
+    """Фоновая задача проверки статистики"""
     logger.info("🔍 Запуск проверки видео...")
     
-    all_videos = tracker.get_all_tracked_videos()
-    logger.info(f"📹 Найдено {len(all_videos)} видео для проверки")
+    cursor = db_conn.cursor()
+    cursor.execute('SELECT DISTINCT video_id FROM monitored_videos')
+    videos = cursor.fetchall()
     
-    for user_id, video in all_videos:
-        video_id = video['video_id']
-        video_url = video['video_url']
-        last_views = video['last_views']
-        last_notified = video['notified_at_views']
-        
-        # Получение текущей статистики
-        stats = await tiktok_monitor.get_video_stats(video_id, video_url)
-        
-        if not stats:
-            logger.warning(f"⚠️ Не удалось получить статистику для {video_id}")
+    logger.info(f"📹 Найдено {len(videos)} видео для проверки")
+    
+    for (video_id,) in videos:
+        try:
+            stats = await tiktok_monitor.get_video_stats(video_id)
+            if stats:
+                # Получаем всех пользователей, отслеживающих это видео
+                cursor.execute('''
+                    SELECT chat_id, last_views, last_likes, last_comments, last_shares 
+                    FROM monitored_videos 
+                    WHERE video_id = ?
+                ''', (video_id,))
+                
+                tracked_videos = cursor.fetchall()
+                
+                for chat_id, old_views, old_likes, old_comments, old_shares in tracked_videos:
+                    # Обновляем статистику
+                    cursor.execute('''
+                        UPDATE monitored_videos 
+                        SET last_views = ?, last_likes = ?, last_comments = ?, last_shares = ?
+                        WHERE chat_id = ? AND video_id = ?
+                    ''', (stats['views'], stats['likes'], stats['comments'], stats['shares'], chat_id, video_id))
+                    
+                    # Сохраняем историю
+                    cursor.execute('''
+                        INSERT INTO video_stats (video_id, views, likes, comments, shares)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (video_id, stats['views'], stats['likes'], stats['comments'], stats['shares']))
+                    
+                    db_conn.commit()
+                    
+        except Exception as e:
+            logger.error(f"Ошибка проверки видео {video_id}: {e}")
             continue
-        
-        current_views = stats['views']
-        tracker.update_video_stats(user_id, video_id, stats)
-        
-        # Проверка, достигнут ли новый рубеж в 50,000
-        current_milestone = (current_views // 50000) * 50000
-        last_milestone = (last_notified // 50000) * 50000
-        
-        if current_milestone > last_milestone and current_milestone > 0:
-            # Отправка уведомления
-            try:
-                message = (
-                    f"🎉 *Поздравляем! Новая веха достигнута!*\n\n"
-                    f"Видео `{video_id[:15]}...` достигло *{current_milestone:,}* просмотров!\n\n"
-                    f"📊 *Текущая статистика:*\n"
-                    f"👁 Просмотры: *{stats['views']:,}*\n"
-                    f"❤️ Лайки: *{stats['likes']:,}*\n"
-                    f"🔄 Репосты: *{stats['shares']:,}*\n"
-                    f"⭐ Избранное: *{stats['favorites']:,}*\n\n"
-                    f"🔗 [Открыть видео]({video_url})"
-                )
-                
-                await application.bot.send_message(
-                    chat_id=user_id,
-                    text=message,
-                    parse_mode='Markdown',
-                    disable_web_page_preview=True
-                )
-                
-                # Обновление последнего уведомления
-                video['notified_at_views'] = current_milestone
-                tracker.save_data()
-                
-                logger.info(f"✅ Уведомление отправлено пользователю {user_id} для видео {video_id}")
-            except Exception as e:
-                logger.error(f"❌ Ошибка отправки уведомления: {e}")
     
     logger.info("✅ Проверка видео завершена")
 
-async def periodic_check(application: Application):
-    """Бесконечный цикл периодических проверок"""
-    await asyncio.sleep(60)  # Ждем минуту перед первой проверкой
-    
-    while True:
-        try:
-            await check_videos_task(application)
-        except Exception as e:
-            logger.error(f"❌ Ошибка в периодической проверке: {e}")
-        
-        # Ждем указанное количество минут
-        await asyncio.sleep(CHECK_INTERVAL_MINUTES * 60)
-
-async def health_check(request):
-    """Эндпоинт для проверки здоровья сервиса"""
-    return web.Response(text="OK", status=200)
-
 async def webhook_handler(request):
-    """Обработчик webhook запросов от Telegram"""
+    """Обработчик вебхука от Telegram"""
     try:
         data = await request.json()
         update = Update.de_json(data, application.bot)
         await application.process_update(update)
-        return web.Response(status=200)
+        return web.Response(text="OK", status=200)
     except Exception as e:
-        logger.error(f"Ошибка обработки webhook: {e}")
-        return web.Response(status=500)
+        logger.error(f"Ошибка обработки вебхука: {e}")
+        return web.Response(text="Error", status=500)
 
-async def setup_webhook(app_instance):
-    """Настройка webhook"""
-    try:
-        webhook_url = f"{WEBHOOK_URL}/webhook"
-        await app_instance.bot.set_webhook(url=webhook_url)
-        logger.info(f"✅ Webhook установлен: {webhook_url}")
-    except Exception as e:
-        logger.error(f"❌ Ошибка установки webhook: {e}")
+async def health_check(request):
+    """Проверка здоровья приложения"""
+    return web.Response(text="Bot is running", status=200)
 
-# Глобальная переменная для приложения
-application = None
-
-async def start_background_tasks(app):
-    """Запуск фоновых задач"""
+async def on_startup(app):
+    """Действия при запуске приложения"""
     logger.info("🚀 Запуск фоновых задач...")
-    app['check_task'] = asyncio.create_task(periodic_check(application))
+    
+    # Запуск периодической проверки
+    application.job_queue.run_repeating(
+        check_videos_task, 
+        interval=CHECK_INTERVAL, 
+        first=10
+    )
 
-async def cleanup_background_tasks(app):
-    """Очистка фоновых задач"""
-    logger.info("🛑 Остановка фоновых задач...")
-    if 'check_task' in app:
-        app['check_task'].cancel()
-        try:
-            await app['check_task']
-        except asyncio.CancelledError:
-            pass
-
-def main():
-    """Главная функция запуска бота"""
+async def main():
+    """Основная функция запуска"""
     global application
     
+    # Инициализация бота
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Добавление обработчиков
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("list", list_videos))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(telegram.ext.MessageHandler(
+        telegram.ext.filters.TEXT & ~telegram.ext.filters.COMMAND, 
+        handle_message
+    ))
+    
+    # Настройка вебхука
+    await application.bot.set_webhook(f"{WEBHOOK_URL}/webhook")
+    logger.info(f"✅ Webhook установлен: {WEBHOOK_URL}/webhook")
+    
+    # Создание aiohttp приложения
+    app = web.Application()
+    app.router.add_post('/webhook', webhook_handler)
+    app.router.add_get('/', health_check)
+    app.router.add_get('/health', health_check)
+    
+    # Запуск при запуске
+    app.on_startup.append(on_startup)
+    
+    # Запуск сервера
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    
+    logger.info(f"🚀 Запуск веб-сервера на 0.0.0.0:{PORT}")
+    
+    # Бесконечный цикл
+    await asyncio.Future()
+
+if __name__ == '__main__':
+    # Логирование информации о запуске
     logger.info("=" * 60)
     logger.info("🎵 TikTok Monitor Bot - Запуск")
     logger.info("=" * 60)
     logger.info(f"🌐 Порт: {PORT}")
     logger.info(f"🔗 Webhook URL: {WEBHOOK_URL}")
-    logger.info(f"⏱ Интервал проверки: {CHECK_INTERVAL_MINUTES} минут")
-    logger.info(f"🔑 RapidAPI: {'✅ Настроен' if RAPIDAPI_KEY != 'YOUR_KEY' else '❌ Не настроен'}")
+    logger.info(f"⏱ Интервал проверки: {CHECK_INTERVAL} секунд")
+    logger.info(f"🔑 RapidAPI: {'✅ Настроен' if RAPIDAPI_KEY else '❌ Не настроен'}")
     logger.info("=" * 60)
     
-    # Создание приложения Telegram
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    
-    # Регистрация обработчиков команд
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("set", set_command))
-    application.add_handler(CommandHandler("stats", stats_command))
-    application.add_handler(CommandHandler("remove", remove_command))
-    application.add_handler(CallbackQueryHandler(button_callback))
-    
-    # Инициализация бота
-    logger.info("🔧 Инициализация бота...")
-    asyncio.get_event_loop().run_until_complete(application.initialize())
-    asyncio.get_event_loop().run_until_complete(setup_webhook(application))
-    
-    # Создание веб-сервера
-    app = web.Application()
-    app.router.add_get('/health', health_check)
-    app.router.add_get('/', health_check)
-    app.router.add_post('/webhook', webhook_handler)
-    
-    # Запуск фоновых задач
-    app.on_startup.append(start_background_tasks)
-    app.on_cleanup.append(cleanup_background_tasks)
-    
-    logger.info(f"🚀 Запуск веб-сервера на 0.0.0.0:{PORT}")
-    
-    # Запуск веб-сервера
-    web.run_app(app, host='0.0.0.0', port=PORT)
-
-if __name__ == '__main__':
-    main()
+    # Запуск приложения
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Остановка бота...")
+    finally:
+        # Закрытие соединений
+        asyncio.run(tiktok_monitor.close_session())
+        db_conn.close()
