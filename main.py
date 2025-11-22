@@ -15,7 +15,6 @@ from telegram.ext import (
     CallbackQueryHandler
 )
 import requests
-from bs4 import BeautifulSoup
 
 # Настройка логирования
 logging.basicConfig(
@@ -28,7 +27,8 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', 'YOUR_TELEGRAM_BOT_TOKEN')
 WEBHOOK_URL = os.getenv('WEBHOOK_URL', 'https://your-app.onrender.com')
 PORT = int(os.getenv('PORT', '10000'))
-CHECK_INTERVAL_MINUTES = int(os.getenv('CHECK_INTERVAL', '10'))
+CHECK_INTERVAL_MINUTES = int(os.getenv('CHECK_INTERVAL', '72'))  # Изменено на 72 минуты для 20 запросов/день
+RAPIDAPI_KEY = os.getenv('RAPIDAPI_KEY', '8a8054913emsha5bb222aa3d3a45p158b8bjsn77f2a167e65f')
 DATA_FILE = 'tracked_videos.json'
 
 class VideoTracker:
@@ -127,15 +127,14 @@ class VideoTracker:
         return result
 
 class TikTokMonitor:
-    """Класс для работы с TikTok через web scraping"""
+    """Класс для работы с TikTok через RapidAPI"""
     
     def __init__(self):
+        self.api_key = RAPIDAPI_KEY
+        self.api_host = "tiktok-scraper2.p.rapidapi.com"
         self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
+            "X-RapidAPI-Key": self.api_key,
+            "X-RapidAPI-Host": self.api_host
         }
     
     def extract_video_id(self, url: str) -> Optional[str]:
@@ -143,7 +142,7 @@ class TikTokMonitor:
         # Обработка коротких ссылок
         if 'vm.tiktok.com' in url or 'vt.tiktok.com' in url:
             try:
-                response = requests.head(url, headers=self.headers, allow_redirects=True, timeout=10)
+                response = requests.head(url, allow_redirects=True, timeout=10)
                 url = response.url
                 logger.info(f"Получен редирект на: {url}")
             except Exception as e:
@@ -163,168 +162,103 @@ class TikTokMonitor:
         return None
     
     async def get_video_stats(self, video_id: str, video_url: str) -> Optional[Dict]:
-        """Получение статистики видео"""
+        """Получение статистики видео через RapidAPI"""
         try:
-            # Если короткая ссылка, получаем полный URL
-            if 'vm.tiktok.com' in video_url or 'vt.tiktok.com' in video_url:
-                response = requests.head(video_url, headers=self.headers, allow_redirects=True, timeout=10)
-                video_url = response.url
-                logger.info(f"Полный URL: {video_url}")
+            # RapidAPI TikTok Scraper2 endpoint
+            api_url = "https://tiktok-scraper2.p.rapidapi.com/video/info"
             
-            # Получаем страницу
-            response = requests.get(video_url, headers=self.headers, timeout=15)
+            querystring = {"video_url": video_url}
             
-            if response.status_code != 200:
-                logger.error(f"Ошибка загрузки страницы: {response.status_code}")
+            logger.info(f"Запрос к RapidAPI для: {video_id}")
+            response = requests.get(api_url, headers=self.headers, params=querystring, timeout=15)
+            
+            if response.status_code == 200:
+                data = response.json()
+                logger.debug(f"Ответ API: {json.dumps(data, indent=2)[:500]}")
+                
+                # Извлекаем статистику из ответа
+                stats = self._extract_stats_from_response(data)
+                
+                if stats and any(v > 0 for v in stats.values()):
+                    logger.info(f"✅ Статистика для {video_id}: views={stats['views']}, likes={stats['likes']}")
+                    return stats
+                else:
+                    logger.warning(f"Статистика получена, но все значения нулевые")
+                    return None
+            
+            elif response.status_code == 429:
+                logger.error(f"❌ Превышен лимит запросов RapidAPI (429)")
                 return None
             
-            html = response.text
-            
-            # Ищем JSON данные в script тегах
-            stats = self._extract_stats_from_html(html)
-            
-            if stats and any(v > 0 for v in stats.values()):
-                logger.info(f"Статистика для {video_id}: {stats}")
-                return stats
-            
-            logger.warning(f"Не удалось извлечь статистику для {video_id}")
-            return None
-            
-        except Exception as e:
-            logger.error(f"Ошибка получения статистики: {e}")
-            return None
-    
-    def _extract_stats_from_html(self, html: str) -> Optional[Dict]:
-        """Извлечение статистики из HTML"""
-        stats = {
-            'views': 0,
-            'likes': 0,
-            'shares': 0,
-            'favorites': 0
-        }
-        
-        # Ищем JSON в script тегах
-        try:
-            # Паттерн для SIGI_STATE или __UNIVERSAL_DATA_FOR_REHYDRATION__
-            json_patterns = [
-                r'<script[^>]*id="SIGI_STATE"[^>]*>(.*?)</script>',
-                r'<script[^>]*id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
-                r'window\.__UNIVERSAL_DATA_FOR_REHYDRATION__\s*=\s*({.*?});',
-                r'window\[\'SIGI_STATE\'\]\s*=\s*({.*?});',
-            ]
-            
-            for pattern in json_patterns:
-                matches = re.finditer(pattern, html, re.DOTALL)
-                for match in matches:
-                    try:
-                        json_str = match.group(1)
-                        json_data = json.loads(json_str)
-                        
-                        # Рекурсивный поиск статистики
-                        found_stats = self._find_stats_in_json(json_data)
-                        if found_stats and any(v > 0 for v in found_stats.values()):
-                            return found_stats
-                    except json.JSONDecodeError:
-                        continue
-                    except Exception as e:
-                        logger.debug(f"Ошибка парсинга JSON: {e}")
-                        continue
-        
-        except Exception as e:
-            logger.debug(f"Ошибка поиска JSON: {e}")
-        
-        # Если JSON не найден, используем регулярные выражения
-        patterns_map = {
-            'views': [
-                r'"playCount["\']?\s*:\s*["\']?(\d+)',
-                r'"viewCount["\']?\s*:\s*["\']?(\d+)',
-                r'playCount[&quot;]*:(\d+)',
-            ],
-            'likes': [
-                r'"diggCount["\']?\s*:\s*["\']?(\d+)',
-                r'"likeCount["\']?\s*:\s*["\']?(\d+)',
-                r'diggCount[&quot;]*:(\d+)',
-            ],
-            'shares': [
-                r'"shareCount["\']?\s*:\s*["\']?(\d+)',
-                r'shareCount[&quot;]*:(\d+)',
-            ],
-            'favorites': [
-                r'"collectCount["\']?\s*:\s*["\']?(\d+)',
-                r'collectCount[&quot;]*:(\d+)',
-            ]
-        }
-        
-        for key, patterns in patterns_map.items():
-            for pattern in patterns:
-                match = re.search(pattern, html)
-                if match:
-                    try:
-                        stats[key] = int(match.group(1))
-                        break
-                    except (ValueError, IndexError):
-                        continue
-        
-        return stats if any(v > 0 for v in stats.values()) else None
-    
-    def _find_stats_in_json(self, data, depth=0, max_depth=10) -> Optional[Dict]:
-        """Рекурсивный поиск статистики в JSON"""
-        if depth > max_depth or data is None:
-            return None
-        
-        if isinstance(data, str):
-            try:
-                data = json.loads(data)
-            except:
+            elif response.status_code == 403:
+                logger.error(f"❌ Ошибка доступа к RapidAPI (403) - проверьте ключ")
                 return None
-        
-        if isinstance(data, dict):
-            # Прямой поиск stats
-            if 'stats' in data:
+            
+            else:
+                logger.error(f"❌ Ошибка API: {response.status_code} - {response.text[:200]}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Ошибка получения статистики: {e}", exc_info=True)
+            return None
+    
+    def _extract_stats_from_response(self, data: dict) -> Optional[Dict]:
+        """Извлечение статистики из ответа RapidAPI"""
+        try:
+            # Разные форматы ответа API
+            stats_data = None
+            
+            # Формат 1: data.stats
+            if 'data' in data and isinstance(data['data'], dict):
+                if 'stats' in data['data']:
+                    stats_data = data['data']['stats']
+                elif 'play_count' in data['data'] or 'playCount' in data['data']:
+                    stats_data = data['data']
+            
+            # Формат 2: прямо stats в корне
+            elif 'stats' in data:
                 stats_data = data['stats']
-                if isinstance(stats_data, dict):
-                    result = {
-                        'views': stats_data.get('playCount', 0) or stats_data.get('viewCount', 0),
-                        'likes': stats_data.get('diggCount', 0) or stats_data.get('likeCount', 0),
-                        'shares': stats_data.get('shareCount', 0),
-                        'favorites': stats_data.get('collectCount', 0)
-                    }
-                    if any(v > 0 for v in result.values()):
-                        return result
             
-            # Прямой поиск счетчиков
-            if any(k in data for k in ['playCount', 'viewCount', 'diggCount', 'likeCount']):
-                result = {
-                    'views': data.get('playCount', 0) or data.get('viewCount', 0),
-                    'likes': data.get('diggCount', 0) or data.get('likeCount', 0),
-                    'shares': data.get('shareCount', 0),
-                    'favorites': data.get('collectCount', 0)
-                }
-                if any(v > 0 for v in result.values()):
-                    return result
+            # Формат 3: video_info или itemInfo
+            elif 'video_info' in data:
+                stats_data = data['video_info'].get('stats')
+            elif 'itemInfo' in data:
+                item_struct = data['itemInfo'].get('itemStruct', {})
+                stats_data = item_struct.get('stats')
             
-            # Рекурсивный поиск в известных ключах
-            search_keys = ['itemInfo', 'itemStruct', 'videoInfo', 'video', 'item', 'ItemModule', 'Detail']
-            for key in search_keys:
-                if key in data:
-                    result = self._find_stats_in_json(data[key], depth + 1, max_depth)
-                    if result and any(v > 0 for v in result.values()):
-                        return result
+            if not stats_data:
+                logger.warning("Не удалось найти stats в ответе API")
+                return None
             
-            # Поиск в остальных ключах (ограниченно)
-            for key, value in list(data.items())[:20]:
-                if key not in search_keys and isinstance(value, (dict, list)):
-                    result = self._find_stats_in_json(value, depth + 1, max_depth)
-                    if result and any(v > 0 for v in result.values()):
-                        return result
-        
-        elif isinstance(data, list):
-            for item in data[:10]:  # Ограничиваем количество элементов
-                result = self._find_stats_in_json(item, depth + 1, max_depth)
-                if result and any(v > 0 for v in result.values()):
-                    return result
-        
-        return None
+            # Извлекаем значения (поддерживаем разные форматы ключей)
+            result = {
+                'views': (
+                    stats_data.get('playCount') or 
+                    stats_data.get('play_count') or 
+                    stats_data.get('viewCount') or 
+                    stats_data.get('view_count') or 0
+                ),
+                'likes': (
+                    stats_data.get('diggCount') or 
+                    stats_data.get('digg_count') or 
+                    stats_data.get('likeCount') or 
+                    stats_data.get('like_count') or 0
+                ),
+                'shares': (
+                    stats_data.get('shareCount') or 
+                    stats_data.get('share_count') or 0
+                ),
+                'favorites': (
+                    stats_data.get('collectCount') or 
+                    stats_data.get('collect_count') or 0
+                )
+            }
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Ошибка парсинга ответа API: {e}")
+            return None
 
 # Глобальные объекты
 tracker = VideoTracker()
@@ -345,6 +279,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Лайки\n"
         "• Репосты\n"
         "• Добавления в избранное\n\n"
+        f"⏱ Проверка статистики каждые {CHECK_INTERVAL_MINUTES} минут\n\n"
         "Начните с команды /set и укажите ссылку на ваше TikTok видео\\!"
     )
     await update.message.reply_text(welcome_message, parse_mode='MarkdownV2')
@@ -380,10 +315,12 @@ async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not stats:
         await loading_msg.edit_text(
-            "❌ Не удалось получить информацию о видео.\n"
-            "Проверьте, что видео существует и доступно публично.\n\n"
-            "Примечание: TikTok может блокировать автоматические запросы. "
-            "Попробуйте позже или используйте другую ссылку."
+            "❌ Не удалось получить информацию о видео.\n\n"
+            "Возможные причины:\n"
+            "• Видео недоступно или приватное\n"
+            "• Превышен лимит запросов API (20/день)\n"
+            "• Проблемы с RapidAPI\n\n"
+            "Попробуйте позже или проверьте ссылку."
         )
         return
     
@@ -399,7 +336,8 @@ async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"❤️ Лайки: *{stats['likes']:,}*\n"
             f"🔄 Репосты: *{stats['shares']:,}*\n"
             f"⭐ Избранное: *{stats['favorites']:,}*\n\n"
-            f"Вы получите уведомление каждые 50,000 просмотров!"
+            f"⏱ Проверка каждые {CHECK_INTERVAL_MINUTES} минут\n"
+            f"🔔 Уведомление каждые 50,000 просмотров!"
         )
         await loading_msg.edit_text(message, parse_mode='Markdown')
     else:
@@ -449,6 +387,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message_parts.append(
                 f"\n*{idx}. Видео* `{video_id[:12]}...`\n"
                 f"❌ Не удалось получить статистику\n"
+                f"(возможно превышен лимит API)\n"
             )
     
     await loading_msg.edit_text(''.join(message_parts), parse_mode='Markdown')
@@ -508,10 +447,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def check_videos_task(application: Application):
     """Периодическая проверка всех отслеживаемых видео"""
-    logger.info("Запуск проверки видео...")
+    logger.info("🔍 Запуск проверки видео...")
     
     all_videos = tracker.get_all_tracked_videos()
-    logger.info(f"Найдено {len(all_videos)} видео для проверки")
+    logger.info(f"📹 Найдено {len(all_videos)} видео для проверки")
     
     for user_id, video in all_videos:
         video_id = video['video_id']
@@ -523,7 +462,7 @@ async def check_videos_task(application: Application):
         stats = await tiktok_monitor.get_video_stats(video_id, video_url)
         
         if not stats:
-            logger.warning(f"Не удалось получить статистику для {video_id}")
+            logger.warning(f"⚠️ Не удалось получить статистику для {video_id}")
             continue
         
         current_views = stats['views']
@@ -558,11 +497,11 @@ async def check_videos_task(application: Application):
                 video['notified_at_views'] = current_milestone
                 tracker.save_data()
                 
-                logger.info(f"Уведомление отправлено пользователю {user_id} для видео {video_id}")
+                logger.info(f"✅ Уведомление отправлено пользователю {user_id} для видео {video_id}")
             except Exception as e:
-                logger.error(f"Ошибка отправки уведомления: {e}")
+                logger.error(f"❌ Ошибка отправки уведомления: {e}")
     
-    logger.info("Проверка видео завершена")
+    logger.info("✅ Проверка видео завершена")
 
 async def periodic_check(application: Application):
     """Бесконечный цикл периодических проверок"""
@@ -572,7 +511,7 @@ async def periodic_check(application: Application):
         try:
             await check_videos_task(application)
         except Exception as e:
-            logger.error(f"Ошибка в периодической проверке: {e}")
+            logger.error(f"❌ Ошибка в периодической проверке: {e}")
         
         # Ждем указанное количество минут
         await asyncio.sleep(CHECK_INTERVAL_MINUTES * 60)
@@ -606,12 +545,12 @@ application = None
 
 async def start_background_tasks(app):
     """Запуск фоновых задач"""
-    logger.info("Запуск фоновых задач...")
+    logger.info("🚀 Запуск фоновых задач...")
     app['check_task'] = asyncio.create_task(periodic_check(application))
 
 async def cleanup_background_tasks(app):
     """Очистка фоновых задач"""
-    logger.info("Остановка фоновых задач...")
+    logger.info("🛑 Остановка фоновых задач...")
     if 'check_task' in app:
         app['check_task'].cancel()
         try:
@@ -623,12 +562,14 @@ def main():
     """Главная функция запуска бота"""
     global application
     
-    logger.info("=" * 50)
-    logger.info("Запуск TikTok Monitor Bot")
-    logger.info("=" * 50)
-    logger.info(f"Порт: {PORT}")
-    logger.info(f"Webhook URL: {WEBHOOK_URL}")
-    logger.info(f"Интервал проверки: {CHECK_INTERVAL_MINUTES} минут")
+    logger.info("=" * 60)
+    logger.info("🎵 TikTok Monitor Bot - Запуск")
+    logger.info("=" * 60)
+    logger.info(f"🌐 Порт: {PORT}")
+    logger.info(f"🔗 Webhook URL: {WEBHOOK_URL}")
+    logger.info(f"⏱ Интервал проверки: {CHECK_INTERVAL_MINUTES} минут")
+    logger.info(f"🔑 RapidAPI: {'✅ Настроен' if RAPIDAPI_KEY != 'YOUR_KEY' else '❌ Не настроен'}")
+    logger.info("=" * 60)
     
     # Создание приложения Telegram
     application = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -641,14 +582,14 @@ def main():
     application.add_handler(CallbackQueryHandler(button_callback))
     
     # Инициализация бота
-    logger.info("Инициализация бота...")
+    logger.info("🔧 Инициализация бота...")
     asyncio.get_event_loop().run_until_complete(application.initialize())
     asyncio.get_event_loop().run_until_complete(setup_webhook(application))
     
     # Создание веб-сервера
     app = web.Application()
     app.router.add_get('/health', health_check)
-    app.router.add_get('/', health_check)  # Дополнительный эндпоинт для корня
+    app.router.add_get('/', health_check)
     app.router.add_post('/webhook', webhook_handler)
     
     # Запуск фоновых задач
