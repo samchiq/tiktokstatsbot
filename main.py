@@ -7,7 +7,7 @@ import aiohttp
 from aiohttp import web
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 import urllib.parse
 
 # Настройка логирования
@@ -18,11 +18,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Конфигурация
-BOT_TOKEN = os.getenv('BOT_TOKEN')
+BOT_TOKEN = os.getenv('TELEGRAM_TOKEN')
 RAPIDAPI_KEY = os.getenv('RAPIDAPI_KEY')
 WEBHOOK_URL = os.getenv('WEBHOOK_URL', 'https://tiktokstatsbot.onrender.com')
 PORT = int(os.getenv('PORT', 10000))
-CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', 5400))  # 90 минут
+CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', 5400))  # 90 минут в секундах
 
 # Инициализация базы данных
 def init_db():
@@ -141,7 +141,8 @@ class TikTokMonitor:
         try:
             parsed = urllib.parse.urlparse(url)
             if 'vm.tiktok.com' in url or 'vt.tiktok.com' in url:
-                return self.get_redirect_video_id(url)
+                # Для коротких ссылок нужен async метод
+                return None  # Будет обработано отдельно
             
             path_parts = parsed.path.split('/')
             if 'video' in path_parts:
@@ -213,7 +214,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Пожалуйста, отправьте действительную ссылку на видео TikTok.")
         return
 
-    video_id = tiktok_monitor.extract_video_id(text)
+    # Обработка коротких ссылок
+    if 'vm.tiktok.com' in text or 'vt.tiktok.com' in text:
+        video_id = await tiktok_monitor.get_redirect_video_id(text)
+    else:
+        video_id = tiktok_monitor.extract_video_id(text)
+    
     if not video_id:
         await update.message.reply_text("❌ Не удалось извлечь ID видео из ссылки.")
         return
@@ -223,7 +229,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     stats = await tiktok_monitor.get_video_stats(video_id)
     if not stats:
-        await loading_msg.edit_text("❌ Не удалось получить статистику видео. Проверьте ссылку.")
+        await loading_msg.edit_text("❌ Не удалось получить статистику видео. Проверьте ссылку или попробуйте позже (возможно превышен лимит API).")
         return
 
     # Сохраняем видео для отслеживания
@@ -292,7 +298,7 @@ async def list_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_text = "📋 Ваши отслеживаемые видео:\n\n"
     
     for i, (video_id, url, views, likes, comments, shares) in enumerate(videos, 1):
-        message_text += f"{i}. {url}\n"
+        message_text += f"{i}. {url[:50]}...\n"
         message_text += f"   👁️ {views:,} | ❤️ {likes:,} | 💬 {comments:,} | ↩️ {shares:,}\n\n"
     
     await update.message.reply_text(message_text)
@@ -306,20 +312,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = query.message.chat_id
     
     if data.startswith('refresh_'):
-        video_id = data.split('_')[1]
+        video_id = data.split('_', 1)[1]
         await refresh_stats(query, video_id)
         
     elif data.startswith('delete_'):
-        video_id = data.split('_')[1]
+        video_id = data.split('_', 1)[1]
         await delete_video(query, video_id)
 
 async def refresh_stats(query, video_id):
     """Обновление статистики"""
-    loading_msg = await query.edit_message_text("🔄 Обновляем статистику...")
+    await query.edit_message_text("🔄 Обновляем статистику...")
     
     stats = await tiktok_monitor.get_video_stats(video_id)
     if not stats:
-        await loading_msg.edit_text("❌ Не удалось обновить статистику.")
+        await query.edit_message_text("❌ Не удалось обновить статистику. Возможно превышен лимит API.")
         return
     
     # Обновляем статистику в БД
@@ -353,7 +359,7 @@ async def refresh_stats(query, video_id):
 ↩️ Репосты: {stats['shares']:,}
     """.strip()
     
-    await loading_msg.edit_text(stats_text, reply_markup=reply_markup)
+    await query.edit_message_text(stats_text, reply_markup=reply_markup)
 
 async def delete_video(query, video_id):
     """Удаление видео из отслеживания"""
@@ -446,10 +452,10 @@ async def main():
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("list", list_videos))
     application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(telegram.ext.MessageHandler(
-        telegram.ext.filters.TEXT & ~telegram.ext.filters.COMMAND, 
-        handle_message
-    ))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Инициализация бота
+    await application.initialize()
     
     # Настройка вебхука
     await application.bot.set_webhook(f"{WEBHOOK_URL}/webhook")
